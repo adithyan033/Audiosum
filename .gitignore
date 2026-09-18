@@ -1,0 +1,19 @@
+# Virtual environment
+env/
+
+# Audio files
+*.mp3
+
+# Whisper output files
+*.json
+*.srt
+*.tsv
+*.txt
+*.vtt
+
+# Generated output
+output.mp3
+
+# Python cache
+__pycache__/
+*.pyc

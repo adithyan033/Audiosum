@@ -1,118 +1,164 @@
+import re
+import torch
 
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    AutoModelForSequenceClassification
+)
+
+from sentence_transformers import SentenceTransformer, util
 
 
 # ============================================================
-# LOAD BART
+# 1. LOAD BART
 # ============================================================
 
-MODEL_NAME = "facebook/bart-large-cnn"
+BART_MODEL = "facebook/bart-large-cnn"
 
-print("Loading BART model...")
+print("Loading BART...")
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+bart_tokenizer = AutoTokenizer.from_pretrained(BART_MODEL)
+bart_model = AutoModelForSeq2SeqLM.from_pretrained(BART_MODEL)
 
-print("BART model loaded successfully!")
+print("BART loaded successfully!")
+
+
+# ============================================================
+# 2. LOAD SENTENCE TRANSFORMER
+# ============================================================
+
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+print("\nLoading Sentence Transformer...")
+
+embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+
+print("Sentence Transformer loaded successfully!")
+
+
+# ============================================================
+# 3. LOAD NLI MODEL
+# ============================================================
+
+NLI_MODEL = "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"
+
+print("\nLoading NLI model...")
+
+nli_tokenizer = AutoTokenizer.from_pretrained(NLI_MODEL)
+nli_model = AutoModelForSequenceClassification.from_pretrained(NLI_MODEL)
+
+print("NLI model loaded successfully!")
 
 
 # ============================================================
 # SETTINGS
 # ============================================================
 
-# Keep below BART's 1024-token input limit
 CHUNK_SIZE = 900
-
-# Number of tokens allowed when combining summaries
 GROUP_SIZE = 850
 
+TOP_K = 5
+
+# Minimum semantic similarity used to select
+# relevant source sentences.
+SIMILARITY_THRESHOLD = 0.40
+
+# Minimum NLI entailment probability.
+ENTAILMENT_THRESHOLD = 0.60
+
 
 # ============================================================
-# SPLIT TEXT INTO TOKEN-LIMITED CHUNKS
+# 4. SPLIT TEXT INTO SENTENCES
 # ============================================================
 
-def split_into_chunks(text, max_tokens=CHUNK_SIZE):
+def split_into_sentences(text):
 
-    sentences = text.split(".")
+    sentences = re.split(
+        r'(?<=[.!?])\s+',
+        text.strip()
+    )
+
+    return [
+        sentence.strip()
+        for sentence in sentences
+        if sentence.strip()
+    ]
+
+
+# ============================================================
+# 5. TOKEN-BASED CHUNKING
+# ============================================================
+
+def split_into_chunks(text):
+
+    sentences = split_into_sentences(text)
 
     chunks = []
-    current_chunk = ""
+    current_chunk = []
+    current_tokens = 0
 
     for sentence in sentences:
 
-        sentence = sentence.strip()
-
-        if not sentence:
-            continue
-
-        sentence = sentence + "."
-
-        test_chunk = (
-            current_chunk + " " + sentence
-        ).strip()
-
-        token_count = len(
-            tokenizer.encode(
-                test_chunk,
-                add_special_tokens=True
+        sentence_tokens = len(
+            bart_tokenizer.encode(
+                sentence,
+                add_special_tokens=False
             )
         )
 
-        if token_count > max_tokens:
+        # If adding this sentence exceeds the limit,
+        # save the current chunk.
+        if (
+            current_tokens + sentence_tokens > CHUNK_SIZE
+            and current_chunk
+        ):
 
-            if current_chunk:
-                chunks.append(
-                    current_chunk.strip()
-                )
+            chunks.append(
+                " ".join(current_chunk)
+            )
 
-            current_chunk = sentence
+            current_chunk = []
+            current_tokens = 0
 
-        else:
+        current_chunk.append(sentence)
+        current_tokens += sentence_tokens
 
-            current_chunk = test_chunk
-
+    # Add remaining text
     if current_chunk:
+
         chunks.append(
-            current_chunk.strip()
+            " ".join(current_chunk)
         )
 
     return chunks
 
 
 # ============================================================
-# SUMMARIZE ONE PIECE OF TEXT
+# 6. BART SUMMARIZATION
 # ============================================================
 
-def summarize_text(
-    text,
-    max_new_tokens=150,
-    min_new_tokens=40
-):
+def summarize_text(text):
 
-    inputs = tokenizer(
+    inputs = bart_tokenizer(
         text,
         return_tensors="pt",
-        max_length=1024,
-        truncation=True
+        truncation=True,
+        max_length=1024
     )
 
-    outputs = model.generate(
+    with torch.no_grad():
 
-        **inputs,
+        summary_ids = bart_model.generate(
+            **inputs,
+            num_beams=4,
+            length_penalty=1.0,
+            early_stopping=True,
+            max_new_tokens=180
+        )
 
-        max_new_tokens=max_new_tokens,
-        min_new_tokens=min_new_tokens,
-
-        num_beams=4,
-
-        # 1.0 gives a balanced summary length
-        length_penalty=1.0,
-
-        early_stopping=True
-    )
-
-    summary = tokenizer.decode(
-        outputs[0],
+    summary = bart_tokenizer.decode(
+        summary_ids[0],
         skip_special_tokens=True
     )
 
@@ -120,254 +166,424 @@ def summarize_text(
 
 
 # ============================================================
-# COMBINE SUMMARIES INTO MANAGEABLE GROUPS
+# 7. SUMMARIZE ALL CHUNKS
 # ============================================================
 
-def group_summaries(
-    summaries,
-    max_tokens=GROUP_SIZE
-):
+def summarize_chunks(chunks):
+
+    summaries = []
+
+    # print("\nSummarizing chunks...\n")
+
+    for i, chunk in enumerate(chunks):
+
+        # print(
+        #     f"Summarizing chunk "
+        #     f"{i + 1}/{len(chunks)}..."
+        # )
+
+        summary = summarize_text(chunk)
+
+        summaries.append(summary)
+
+    return summaries
+
+
+# ============================================================
+# 8. GROUP SUMMARIES
+# ============================================================
+
+def group_summaries(summaries):
 
     groups = []
-
-    current_group = ""
+    current_group = []
+    current_tokens = 0
 
     for summary in summaries:
 
-        test_group = (
-            current_group + " " + summary
-        ).strip()
-
-        token_count = len(
-            tokenizer.encode(
-                test_group,
-                add_special_tokens=True
+        tokens = len(
+            bart_tokenizer.encode(
+                summary,
+                add_special_tokens=False
             )
         )
 
-        if token_count > max_tokens:
+        if (
+            current_tokens + tokens > GROUP_SIZE
+            and current_group
+        ):
 
-            if current_group:
-                groups.append(
-                    current_group.strip()
-                )
+            groups.append(
+                " ".join(current_group)
+            )
 
-            current_group = summary
+            current_group = []
+            current_tokens = 0
 
-        else:
-
-            current_group = test_group
+        current_group.append(summary)
+        current_tokens += tokens
 
     if current_group:
+
         groups.append(
-            current_group.strip()
+            " ".join(current_group)
         )
 
     return groups
 
 
 # ============================================================
-# HIERARCHICAL SUMMARIZATION
+# 9. HIERARCHICAL SUMMARIZATION
 # ============================================================
 
-def hierarchical_summarize(
-    text,
-    summary_length="medium"
-):
-
-    # --------------------------------------------------------
-    # SET SUMMARY LENGTH
-    # --------------------------------------------------------
-
-    if summary_length == "short":
-
-        chunk_max = 100
-        chunk_min = 30
-
-        final_max = 150
-        final_min = 60
-
-    elif summary_length == "detailed":
-
-        chunk_max = 180
-        chunk_min = 60
-
-        final_max = 350
-        final_min = 150
-
-    else:
-
-# Medium
-        chunk_max = 140
-        chunk_min = 40
-
-        final_max = 250
-        final_min = 100
-
-
-    # --------------------------------------------------------
-    # LEVEL 1
-    # --------------------------------------------------------
+def hierarchical_summarization(text):
 
     chunks = split_into_chunks(text)
 
     print(
-        f"\nText divided into {len(chunks)} chunks."
+        f"\nText divided into "
+        f"{len(chunks)} chunks."
     )
 
-    summaries = []
+    # First level
+    summaries = summarize_chunks(chunks)
 
-    for i, chunk in enumerate(chunks):
-
-        print(
-            f"\nSummarizing chunk "
-            f"{i + 1}/{len(chunks)}..."
-        )
-
-        summary = summarize_text(
-            chunk,
-            max_new_tokens=chunk_max,
-            min_new_tokens=chunk_min
-        )
-
-        summaries.append(summary)
-
-        print("\nChunk Summary:")
-        print(summary)
-
-
-    # --------------------------------------------------------
-    # HIERARCHICAL REDUCTION
-    # --------------------------------------------------------
-
-    level = 1
-
+    # Continue reducing summaries
     while len(summaries) > 1:
 
         print(
-            "\n" + "=" * 60
-        )
-
-        print(
-            f"\nCreating summary level "
-            f"{level + 1}..."
+            f"\nReducing "
+            f"{len(summaries)} summaries..."
         )
 
         groups = group_summaries(summaries)
 
-        print(
-            f"Created {len(groups)} groups."
-        )
-
         new_summaries = []
 
-        for i, group in enumerate(groups):
+        for group in groups:
 
-            print(
-                f"\nSummarizing group "
-                f"{i + 1}/{len(groups)}..."
-            )
-
-            summary = summarize_text(
-                group,
-                max_new_tokens=chunk_max,
-                min_new_tokens=chunk_min
-            )
+            summary = summarize_text(group)
 
             new_summaries.append(summary)
 
-            print("\nGroup Summary:")
-            print(summary)
-
         summaries = new_summaries
 
-        level += 1
+    if summaries:
+
+        return summaries[0]
+
+    return ""
 
 
-    # --------------------------------------------------------
-    # FINAL SUMMARY
-    # --------------------------------------------------------
+# ============================================================
+# 10. FIND RELEVANT SOURCE SENTENCES
+# ============================================================
 
-    print(
-        "\n" + "=" * 60
+def find_relevant_sources(
+    summary_sentence,
+    source_sentences
+):
+
+    source_embeddings = embedding_model.encode(
+        source_sentences,
+        convert_to_tensor=True
     )
 
-    print("\nGenerating final summary...")
-
-    final_summary = summarize_text(
-        summaries[0],
-        max_new_tokens=final_max,
-        min_new_tokens=final_min
+    summary_embedding = embedding_model.encode(
+        summary_sentence,
+        convert_to_tensor=True
     )
 
+    # Calculate cosine similarity
+    scores = util.cos_sim(
+        summary_embedding,
+        source_embeddings
+    )[0]
+
+    # Get highest scoring sentences
+    top_results = torch.topk(
+        scores,
+        k=min(TOP_K, len(source_sentences))
+    )
+
+    relevant_sources = []
+
+    for score, index in zip(
+        top_results.values,
+        top_results.indices
+    ):
+
+        score_value = float(score)
+
+        if score_value >= SIMILARITY_THRESHOLD:
+
+            relevant_sources.append(
+                (
+                    source_sentences[int(index)],
+                    score_value
+                )
+            )
+
+    return relevant_sources
+
+
+# ============================================================
+# 11. NLI CHECK
+# ============================================================
+
+def check_entailment(
+    source_sentence,
+    summary_sentence
+):
+
+    # Premise = original source
+    # Hypothesis = generated summary
+
+    inputs = nli_tokenizer(
+        source_sentence,
+        summary_sentence,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512
+    )
+
+    with torch.no_grad():
+
+        outputs = nli_model(**inputs)
+
+    probabilities = torch.softmax(
+        outputs.logits,
+        dim=-1
+    )[0]
+
+    # Find label mapping from model config
+    id2label = nli_model.config.id2label
+
+    label_scores = {}
+
+    for index, probability in enumerate(probabilities):
+
+        label = id2label[index].lower()
+
+        label_scores[label] = float(probability)
+
+    return label_scores
+
+
+# ============================================================
+# 12. VERIFY SUMMARY SENTENCE
+# ============================================================
+
+def verify_summary_sentence(
+    summary_sentence,
+    source_sentences
+):
+
+    relevant_sources = find_relevant_sources(
+        summary_sentence,
+        source_sentences
+    )
+
+    if not relevant_sources:
+
+        return {
+            "status": "UNSUPPORTED",
+            "source": None,
+            "similarity": 0,
+            "entailment": 0,
+            "contradiction": 0,
+            "neutral": 0
+        }
+
+    best_result = None
+
+    for source, similarity in relevant_sources:
+
+        nli_scores = check_entailment(
+            source,
+            summary_sentence
+        )
+
+        entailment = 0
+        contradiction = 0
+        neutral = 0
+
+        for label, score in nli_scores.items():
+
+            if "entail" in label:
+                entailment = score
+
+            elif "contrad" in label:
+                contradiction = score
+
+            elif "neutral" in label:
+                neutral = score
+
+        result = {
+            "source": source,
+            "similarity": similarity,
+            "entailment": entailment,
+            "contradiction": contradiction,
+            "neutral": neutral
+        }
+
+        # Keep candidate with highest entailment
+        if (
+            best_result is None
+            or entailment > best_result["entailment"]
+        ):
+
+            best_result = result
+
+    # Determine status
+    if best_result["entailment"] >= ENTAILMENT_THRESHOLD:
+
+        status = "SUPPORTED"
+
+    elif best_result["contradiction"] >= 0.60:
+
+        status = "POSSIBLE CONTRADICTION"
+
+    else:
+
+        status = "POTENTIALLY UNSUPPORTED"
+
+    best_result["status"] = status
+
+    return best_result
+
+
+# ============================================================
+# 13. VERIFY COMPLETE SUMMARY
+# ============================================================
+
+def verify_summary(
+    summary,
+    original_text
+):
+
+    source_sentences = split_into_sentences(
+        original_text
+    )
+
+    summary_sentences = split_into_sentences(
+        summary
+    )
+
+    print("\n")
+    print("=" * 70)
+    print("FACTUALITY VERIFICATION")
+    print("=" * 70)
+
+    results = []
+
+    for i, sentence in enumerate(
+        summary_sentences
+    ):
+
+        print(
+            f"\nChecking sentence "
+            f"{i + 1}/{len(summary_sentences)}..."
+        )
+
+        result = verify_summary_sentence(
+            sentence,
+            source_sentences
+        )
+
+        results.append(
+            (sentence, result)
+        )
+
+    return results
+
+
+# ============================================================
+# 14. NEW FUNCTION FOR COMPLETE SUMMARIZATION
+# ============================================================
+#
+# This is the important change.
+#
+# Whisper will send its transcript directly here.
+#
+# Whisper transcript
+#        ↓
+# hierarchical_summarization()
+#        ↓
+# final summary
+#        ↓
+# verify_summary()
+#
+# ============================================================
+
+def summarize_transcript(text):
+
+    if not text or not text.strip():
+        print("ERROR: Empty transcript.")
+        return ""
+
+    # Generate summary
+    final_summary = hierarchical_summarization(text)
+
+    # Print the exact generated summary
+    print("\n")
+    print("=" * 70)
+    print("FINAL SUMMARY")
+    print("=" * 70)
+    print(final_summary)
+
+    # Verify summary
+    verification_results = verify_summary(
+        final_summary,
+        text
+    )
+
+    # Return the EXACT same summary
     return final_summary
-
-
 # ============================================================
-# MAIN PROGRAM
+# 15. OPTIONAL TEST
+# ============================================================
+#
+# This section is only for testing summarizer.py separately.
+#
+# It is NOT needed when pipeline.py is being used.
+#
 # ============================================================
 
-print(
-    "\n" + "=" * 60
-)
+if __name__ == "__main__":
 
-with open("input.txt", "r") as f:
-    text = f.read()
+    try:
 
+        with open(
+            "input.txt",
+            "r",
+            encoding="utf-8"
+        ) as file:
 
-# ------------------------------------------------------------
-# SELECT SUMMARY LENGTH
-# ------------------------------------------------------------
+            text = file.read()
 
-print("\nChoose summary length:")
+    except FileNotFoundError:
 
-print("1. Short")
-print("2. Medium")
-print("3. Detailed")
+        print(
+            "ERROR: input.txt not found."
+        )
 
-choice = input(
-    "\nEnter your choice (1/2/3): "
-)
+        print(
+            "\nWhen using the complete audio pipeline,"
+        )
 
-if choice == "1":
+        print(
+            "run pipeline.py instead."
+        )
 
-    summary_length = "short"
+    else:
 
-elif choice == "3":
+        if not text.strip():
 
-    summary_length = "detailed"
+            print(
+                "ERROR: input.txt is empty."
+            )
 
-else:
+        else:
 
-    summary_length = "medium"
-
-
-# ------------------------------------------------------------
-# GENERATE SUMMARY
-# ------------------------------------------------------------
-
-final_summary = hierarchical_summarize(
-    text,
-    summary_length
-)
-
-
-# ------------------------------------------------------------
-# DISPLAY FINAL SUMMARY
-# ------------------------------------------------------------
-
-print(
-    "\n" + "=" * 60
-)
-
-print("\nFINAL SUMMARY:\n")
-
-print(final_summary)
-
-print(
-    "\n" + "=" * 60
-)
-
-print(
-    "\nSummarization completed successfully!"
-)
+            summarize_transcript(text)
